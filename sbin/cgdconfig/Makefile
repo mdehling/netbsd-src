@@ -29,4 +29,22 @@ ARGON2_NO_THREADS=1
 .include "${NETBSDSRCDIR}/external/apache2/argon2/lib/libargon2/Makefile.inc"
 .endif
 
+.if ${MKZFS} != "no"
+DPADD+=	${LIBNVPAIR}
+LDADD+=	-lnvpair
+CPPFLAGS+=	-DHAVE_ZFS
+
+OSNET=${NETBSDSRCDIR}/external/cddl/osnet
+CPPFLAGS.cgdconfig.c+=	-I${OSNET}/include
+CPPFLAGS.cgdconfig.c+=	-I${OSNET}/sys
+CPPFLAGS.cgdconfig.c+=	-I${OSNET}/dist/head
+CPPFLAGS.cgdconfig.c+=	-I${OSNET}/dist/lib/libzpool/common
+CPPFLAGS.cgdconfig.c+=	-I${OSNET}/dist/uts/common
+CPPFLAGS.cgdconfig.c+=	-I${OSNET}/dist/uts/common/fs/zfs
+CPPFLAGS.cgdconfig.c+=	-I${OSNET}/dist/lib/libnvpair
+
+COPTS.cgdconfig.c+=	-Wno-unknown-pragmas
+COPTS.cgdconfig.c+=	-Wno-strict-prototypes
+.endif
+
 .include <bsd.prog.mk>

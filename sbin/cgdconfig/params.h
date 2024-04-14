@@ -81,6 +81,7 @@ struct params {
 #define VERIFY_REENTER		0x4
 #define VERIFY_MBR      	0x5
 #define VERIFY_GPT      	0x6
+#define VERIFY_ZFS      	0x7
 
 /* shared key derivation methods */
 

@@ -42,6 +42,10 @@ LISTS+=		${.CURDIR}/list.${f}
 LISTS+=		${.CURDIR}/list.inet6
 .endif
 
+.if ${MKZFS} != "no"
+LISTS+=		${.CURDIR}/list.zfs
+.endif
+
 LISTS+=		${.CURDIR}/list.crypto
 CRUNCHENV+=	MKKERBEROS=no		# for ssh
 

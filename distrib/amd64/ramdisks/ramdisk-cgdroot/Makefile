@@ -9,6 +9,9 @@ SMALLPROG_INET6=1
 .include "${.CURDIR}/../common/Makefile.ramdisk"
 
 LISTS+=		${DISTRIBDIR}/common/list.cgdroot
+.if ${MKZFS} != "no"
+LISTS+=		${.CURDIR}/list.zfs
+.endif
 MTREECONF+=	${DISTRIBDIR}/common/mtree.cgdroot
 
 .if ${USE_INET6} != "no"

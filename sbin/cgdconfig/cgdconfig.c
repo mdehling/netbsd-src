@@ -73,6 +73,11 @@ __RCSID("$NetBSD: cgdconfig.c,v 1.61 2022/11/17 06:40:38 chs Exp $");
 
 #include <ufs/ffs/fs.h>
 
+#ifdef HAVE_ZFS
+#include <libnvpair.h>
+#include <sys/vdev_impl.h>
+#endif
+
 #include "params.h"
 #include "pkcs5_pbkdf2.h"
 #include "utils.h"
@@ -170,6 +175,9 @@ static int	 verify_ffs(int);
 static int	 verify_reenter(struct params *);
 static int	 verify_mbr(int);
 static int	 verify_gpt(int);
+#ifdef HAVE_ZFS
+static int	 verify_zfs(int);
+#endif
 
 __dead static void	 usage(void);
 
@@ -1024,6 +1032,10 @@ verify(struct params *p, int fd)
 		return verify_mbr(fd);
 	case VERIFY_GPT:
 		return verify_gpt(fd);
+#ifdef HAVE_ZFS
+	case VERIFY_ZFS:
+		return verify_zfs(fd);
+#endif
 	default:
 		warnx("unimplemented verification method");
 		return -1;
@@ -1181,6 +1193,47 @@ verify_gpt(int fd)
 
 	return ret;
 }
+
+#ifdef HAVE_ZFS
+static int
+verify_zfs(int fd)
+{
+	vdev_label_t *vdev_label;
+	vdev_phys_t *vdev_phys;
+	nvlist_t *config = NULL;
+	ssize_t ret;
+
+	/*
+	 * Read the first ZFS vdev label located at offset 0.
+	 */
+	vdev_label = emalloc(sizeof *vdev_label);
+	ret = prog_pread(fd, vdev_label, sizeof(*vdev_label), 0);
+	if (ret < 0) {
+		warn("pread");
+		ret = 1;
+		goto bail;
+	} else if ((size_t)ret < sizeof(*vdev_label)) {
+		warnx("pread: incomplete block");
+		ret = 1;
+		goto bail;
+	};
+
+	ret = 0;
+
+	vdev_phys = &(vdev_label->vl_vdev_phys);
+	if ((nvlist_unpack(vdev_phys->vp_nvlist,
+		sizeof(vdev_phys->vp_nvlist), &config, 0)) != 0 ||
+		!nvlist_exists(config, "name"))
+	{
+		ret = 1;
+	};
+
+	nvlist_free(config);
+ bail:
+	free(vdev_label);
+	return ret;
+}
+#endif
 
 static off_t sblock_try[] = SBLOCKSEARCH;
 

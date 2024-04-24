@@ -156,7 +156,7 @@ struct acpibat_softc {
 	int32_t			 sc_dvoltage;
 	int32_t			 sc_lcapacity;
 	int32_t			 sc_wcapacity;
-	int                      sc_present;
+	int			 sc_present;
 	bool			 sc_dying;
 };
 
@@ -181,16 +181,16 @@ static const struct device_compatible_entry compat_data[] = {
 static int	    acpibat_match(device_t, cfdata_t, void *);
 static void	    acpibat_attach(device_t, device_t, void *);
 static int	    acpibat_detach(device_t, int);
-static int          acpibat_get_sta(device_t);
+static int	    acpibat_get_sta(device_t);
 static ACPI_OBJECT *acpibat_get_object(ACPI_HANDLE, const char *, uint32_t);
-static void         acpibat_get_info(device_t);
+static void	    acpibat_get_info(device_t);
 static void	    acpibat_print_info(device_t, ACPI_OBJECT *);
-static void         acpibat_get_status(device_t);
-static void         acpibat_update_info(void *);
-static void         acpibat_update_status(void *);
-static void         acpibat_init_envsys(device_t);
-static void         acpibat_notify_handler(ACPI_HANDLE, uint32_t, void *);
-static void         acpibat_refresh(struct sysmon_envsys *, envsys_data_t *);
+static void	    acpibat_get_status(device_t);
+static void	    acpibat_update_info(void *);
+static void	    acpibat_update_status(void *);
+static void	    acpibat_init_envsys(device_t);
+static void	    acpibat_notify_handler(ACPI_HANDLE, uint32_t, void *);
+static void	    acpibat_refresh(struct sysmon_envsys *, envsys_data_t *);
 static bool	    acpibat_resume(device_t, const pmf_qual_t *);
 static void	    acpibat_get_limits(struct sysmon_envsys *, envsys_data_t *,
 				       sysmon_envsys_lim_t *, uint32_t *);
@@ -728,7 +728,7 @@ acpibat_init_envsys(device_t dv)
 #undef INITDATA
 
 	sc->sc_sensor[ACPIBAT_CHARGE_STATE].value_cur =
-		ENVSYS_BATTERY_CAPACITY_NORMAL;
+	    ENVSYS_BATTERY_CAPACITY_NORMAL;
 
 	sc->sc_sensor[ACPIBAT_CAPACITY].flags |=
 	    ENVSYS_FPERCENT | ENVSYS_FVALID_MAX | ENVSYS_FMONLIMITS;
@@ -751,7 +751,7 @@ acpibat_init_envsys(device_t dv)
 
 	for (i = 0; i < ACPIBAT_COUNT; i++) {
 		if (sysmon_envsys_sensor_attach(sc->sc_sme,
-			&sc->sc_sensor[i]))
+		    &sc->sc_sensor[i]))
 			goto fail;
 	}
 

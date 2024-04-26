@@ -85,6 +85,7 @@ __KERNEL_RCSID(0, "$NetBSD: acpi_bat.c,v 1.121 2022/01/07 01:10:57 riastradh Exp
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/systm.h>
+#include <sys/sysctl.h>
 
 #include <dev/acpi/acpireg.h>
 #include <dev/acpi/acpivar.h>
@@ -94,6 +95,7 @@ ACPI_MODULE_NAME		 ("acpi_bat")
 
 #define	ACPI_NOTIFY_BAT_STATUS	 0x80
 #define	ACPI_NOTIFY_BAT_INFO	 0x81
+#define	ACPI_NOTIFY_BMD_STATUS	 0x82
 
 /*
  * Sensor indexes.
@@ -145,8 +147,49 @@ enum {
 	ACPIBAT_BST_COUNT	 = 4
 };
 
+/*
+ * Battery Maintenance Data, _BMD
+ * (ACPI 4.0a, sec. 10.2.2.10).
+ */
+enum {
+	ACPIBAT_BMD_STATUS	 = 0,
+	ACPIBAT_BMD_CAPABILITY	 = 1,
+	ACPIBAT_BMD_NRECALIBR	 = 2,
+	ACPIBAT_BMD_QRECALIBRT	 = 3,
+	ACPIBAT_BMD_SRECALIBRT	 = 4,
+	ACPIBAT_BMD_COUNT	 = 5
+};
+
+/* Format of _BMD status flags */
+typedef union acpibat_bmd_status {
+	uint32_t		 raw;
+	struct {
+		uint8_t		 calibrate:1;
+		uint8_t		 charge_inhibit:1;
+		uint8_t		 force_discharge:1;
+		uint8_t		 recalibration_req:1;
+		uint8_t		 standby_req:1;
+		uint32_t	 reserved:27;
+	} __packed		 flag;
+} acpibat_bmd_status_t;
+
+/* Format of _BMD capability flags */
+typedef union acpibat_bmd_capability {
+	uint32_t		 raw;
+	struct {
+		uint8_t		 calibrate:1;
+		uint8_t		 charge_inhibit:1;
+		uint8_t		 force_discharge:1;
+		uint8_t		 affect_all:1;
+		uint8_t		 fullcharge_req:1;
+		uint32_t	 reserved:27;
+	} __packed		 flag;
+} acpibat_bmd_capability_t;
+
 struct acpibat_softc {
 	struct acpi_devnode	*sc_node;
+	struct sysctllog	*sc_log;
+
 	struct sysmon_envsys	*sc_sme;
 	struct timeval		 sc_last;
 	envsys_data_t		*sc_sensor;
@@ -156,8 +199,12 @@ struct acpibat_softc {
 	int32_t			 sc_dvoltage;
 	int32_t			 sc_lcapacity;
 	int32_t			 sc_wcapacity;
-	int                      sc_present;
+	int			 sc_present;
 	bool			 sc_dying;
+
+	bool			 sc_have_bmd;
+	acpibat_bmd_status_t	 sc_bmd_status;
+	acpibat_bmd_capability_t sc_bmd_capability;
 };
 
 static const struct device_compatible_entry compat_data[] = {
@@ -181,19 +228,22 @@ static const struct device_compatible_entry compat_data[] = {
 static int	    acpibat_match(device_t, cfdata_t, void *);
 static void	    acpibat_attach(device_t, device_t, void *);
 static int	    acpibat_detach(device_t, int);
-static int          acpibat_get_sta(device_t);
+static int	    acpibat_get_sta(device_t);
 static ACPI_OBJECT *acpibat_get_object(ACPI_HANDLE, const char *, uint32_t);
-static void         acpibat_get_info(device_t);
+static void	    acpibat_get_info(device_t);
 static void	    acpibat_print_info(device_t, ACPI_OBJECT *);
-static void         acpibat_get_status(device_t);
-static void         acpibat_update_info(void *);
-static void         acpibat_update_status(void *);
-static void         acpibat_init_envsys(device_t);
-static void         acpibat_notify_handler(ACPI_HANDLE, uint32_t, void *);
-static void         acpibat_refresh(struct sysmon_envsys *, envsys_data_t *);
+static void	    acpibat_get_status(device_t);
+static ACPI_STATUS  acpibat_get_bmd(device_t);
+static void	    acpibat_update_info(void *);
+static void	    acpibat_update_status(void *);
+static void	    acpibat_update_bmd(void *);
+static void	    acpibat_init_envsys(device_t);
+static void	    acpibat_notify_handler(ACPI_HANDLE, uint32_t, void *);
+static void	    acpibat_refresh(struct sysmon_envsys *, envsys_data_t *);
 static bool	    acpibat_resume(device_t, const pmf_qual_t *);
 static void	    acpibat_get_limits(struct sysmon_envsys *, envsys_data_t *,
 				       sysmon_envsys_lim_t *, uint32_t *);
+static void	    acpibat_sysctl_setup(device_t);
 
 CFATTACH_DECL_NEW(acpibat, sizeof(struct acpibat_softc),
     acpibat_match, acpibat_attach, acpibat_detach, NULL);
@@ -228,6 +278,7 @@ acpibat_attach(device_t parent, device_t self, void *aux)
 	aprint_normal(": ACPI Battery\n");
 
 	sc->sc_node = aa->aa_node;
+	sc->sc_log = NULL;
 
 	sc->sc_present = 0;
 	sc->sc_dvoltage = 0;
@@ -242,6 +293,16 @@ acpibat_attach(device_t parent, device_t self, void *aux)
 
 	sc->sc_sensor = kmem_zalloc(ACPIBAT_COUNT *
 	    sizeof(*sc->sc_sensor), KM_SLEEP);
+
+	rv = acpibat_get_bmd(self);
+	if (ACPI_SUCCESS(rv)) {
+		sc->sc_have_bmd = true;
+		aprint_verbose_dev(self,
+		    "battery maintenance capabilities: %x\n",
+		    sc->sc_bmd_capability.raw);
+		acpibat_sysctl_setup(self);
+	} else
+		sc->sc_have_bmd = false;
 
 	config_interrupts(self, acpibat_init_envsys);
 
@@ -292,6 +353,9 @@ acpibat_detach(device_t self, int flags)
 
 	cv_destroy(&sc->sc_condvar);
 	mutex_destroy(&sc->sc_mutex);
+
+	if (sc->sc_log != NULL)
+		sysctl_teardown(&sc->sc_log);
 
 	return 0;
 }
@@ -608,6 +672,44 @@ out:
 		    AcpiFormatException(rv));
 }
 
+/*
+ * acpibat_get_bmd:
+ *
+ *	Get battery maintenance data.
+ */
+static ACPI_STATUS
+acpibat_get_bmd(device_t dv)
+{
+	struct acpibat_softc *sc = device_private(dv);
+	ACPI_HANDLE hdl = sc->sc_node->ad_handle;
+	ACPI_OBJECT *elm, *obj;
+	ACPI_STATUS rv = AE_OK;
+	int i;
+
+	obj = acpibat_get_object(hdl, "_BMD", ACPIBAT_BMD_COUNT);
+	if (obj == NULL) {
+		rv = AE_ERROR;
+		goto out;
+	}
+
+	elm = obj->Package.Elements;
+	for (i = ACPIBAT_BMD_STATUS; i < ACPIBAT_BMD_COUNT; i++) {
+		if (elm[i].Type != ACPI_TYPE_INTEGER) {
+			rv = AE_TYPE;
+			goto out;
+		}
+	}
+
+	sc->sc_bmd_status.raw = elm[ACPIBAT_BMD_STATUS].Integer.Value;
+	sc->sc_bmd_capability.raw = elm[ACPIBAT_BMD_CAPABILITY].Integer.Value;
+
+out:
+	if (obj != NULL)
+		ACPI_FREE(obj);
+
+	return rv;
+}
+
 static void
 acpibat_update_info(void *arg)
 {
@@ -674,6 +776,24 @@ acpibat_update_status(void *arg)
 	mutex_exit(&sc->sc_mutex);
 }
 
+static void
+acpibat_update_bmd(void *arg)
+{
+	device_t dv = arg;
+	struct acpibat_softc *sc = device_private(dv);
+	ACPI_STATUS rv;
+
+	if (!sc->sc_have_bmd)
+	    return;
+
+	mutex_enter(&sc->sc_mutex);
+	rv = acpibat_get_bmd(dv);
+	if (ACPI_FAILURE(rv))
+		aprint_error_dev(dv, "unable to evaluate _BMD: %s\n",
+		    AcpiFormatException(rv));
+	mutex_exit(&sc->sc_mutex);
+}
+
 /*
  * acpibat_notify_handler:
  *
@@ -694,6 +814,9 @@ acpibat_notify_handler(ACPI_HANDLE handle, uint32_t notify, void *context)
 		break;
 	case ACPI_NOTIFY_BAT_STATUS:
 		(void)AcpiOsExecute(handler, acpibat_update_status, dv);
+		break;
+	case ACPI_NOTIFY_BMD_STATUS:
+		(void)AcpiOsExecute(handler, acpibat_update_bmd, dv);
 		break;
 	default:
 		aprint_error_dev(dv, "unknown notify: 0x%02X\n", notify);
@@ -728,7 +851,7 @@ acpibat_init_envsys(device_t dv)
 #undef INITDATA
 
 	sc->sc_sensor[ACPIBAT_CHARGE_STATE].value_cur =
-		ENVSYS_BATTERY_CAPACITY_NORMAL;
+	    ENVSYS_BATTERY_CAPACITY_NORMAL;
 
 	sc->sc_sensor[ACPIBAT_CAPACITY].flags |=
 	    ENVSYS_FPERCENT | ENVSYS_FVALID_MAX | ENVSYS_FMONLIMITS;
@@ -751,7 +874,7 @@ acpibat_init_envsys(device_t dv)
 
 	for (i = 0; i < ACPIBAT_COUNT; i++) {
 		if (sysmon_envsys_sensor_attach(sc->sc_sme,
-			&sc->sc_sensor[i]))
+		    &sc->sc_sensor[i]))
 			goto fail;
 	}
 
@@ -765,6 +888,7 @@ acpibat_init_envsys(device_t dv)
 	(void)acpi_register_notify(sc->sc_node, acpibat_notify_handler);
 	acpibat_update_info(dv);
 	acpibat_update_status(dv);
+	acpibat_update_bmd(dv);
 
 	if (sysmon_envsys_register(sc->sc_sme))
 		goto fail;
@@ -775,6 +899,8 @@ acpibat_init_envsys(device_t dv)
 
 fail:
 	aprint_error_dev(dv, "failed to initialize sysmon\n");
+
+	(void)acpi_deregister_notify(sc->sc_node);
 
 	sysmon_envsys_destroy(sc->sc_sme);
 	kmem_free(sc->sc_sensor, ACPIBAT_COUNT * sizeof(*sc->sc_sensor));
@@ -817,6 +943,7 @@ acpibat_resume(device_t dv, const pmf_qual_t *qual)
 
 	(void)AcpiOsExecute(OSL_NOTIFY_HANDLER, acpibat_update_info, dv);
 	(void)AcpiOsExecute(OSL_NOTIFY_HANDLER, acpibat_update_status, dv);
+	(void)AcpiOsExecute(OSL_NOTIFY_HANDLER, acpibat_update_bmd, dv);
 
 	return true;
 }
@@ -835,6 +962,164 @@ acpibat_get_limits(struct sysmon_envsys *sme, envsys_data_t *edata,
 	limits->sel_warnmin = sc->sc_wcapacity;
 
 	*props |= PROP_BATTCAP | PROP_BATTWARN | PROP_DRIVER_LIMITS;
+}
+
+static int
+acpibat_sysctl_calibrate(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	device_t dv = node.sysctl_data;
+	struct acpibat_softc *sc = device_private(dv);
+	bool calibrate;
+	int err;
+	ACPI_STATUS rv;
+
+	calibrate = sc->sc_bmd_status.flag.calibrate;
+
+	node.sysctl_data = &calibrate;
+	err = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (err || newp == NULL)
+		return err;
+
+	mutex_enter(&sc->sc_mutex);
+
+	if (!sc->sc_bmd_capability.flag.calibrate) {
+		err = ENOTTY;
+		goto out;
+	}
+
+	rv = acpi_eval_set_integer(sc->sc_node->ad_handle, "_BMC",
+	    sc->sc_bmd_status.raw & 0x07);
+	if (ACPI_FAILURE(rv)) {
+		aprint_error_dev(dv, "could not set _BMC: %s\n",
+		    AcpiFormatException(rv));
+		err = EIO;
+		goto out;
+	}
+	sc->sc_bmd_status.flag.calibrate = calibrate;
+out:
+	mutex_exit(&sc->sc_mutex);
+	return err;
+}
+
+static int
+acpibat_sysctl_charge_inhibit(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	device_t dv = node.sysctl_data;
+	struct acpibat_softc *sc = device_private(dv);
+	bool charge_inhibit;
+	int err;
+	ACPI_STATUS rv;
+
+	charge_inhibit = sc->sc_bmd_status.flag.charge_inhibit;
+
+	node.sysctl_data = &charge_inhibit;
+	err = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (err || newp == NULL)
+		return err;
+
+	mutex_enter(&sc->sc_mutex);
+
+	if (!sc->sc_bmd_capability.flag.charge_inhibit) {
+		err = ENOTTY;
+		goto out;
+	}
+
+	rv = acpi_eval_set_integer(sc->sc_node->ad_handle, "_BMC",
+	    sc->sc_bmd_status.raw & 0x07);
+	if (ACPI_FAILURE(rv)) {
+		aprint_error_dev(dv, "could not set _BMC: %s\n",
+		    AcpiFormatException(rv));
+		err = EIO;
+		goto out;
+	}
+	sc->sc_bmd_status.flag.charge_inhibit = charge_inhibit;
+out:
+	mutex_exit(&sc->sc_mutex);
+	return err;
+}
+
+static int
+acpibat_sysctl_force_discharge(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node = *rnode;
+	device_t dv = node.sysctl_data;
+	struct acpibat_softc *sc = device_private(dv);
+	bool force_discharge;
+	int err;
+	ACPI_STATUS rv;
+
+	force_discharge = sc->sc_bmd_status.flag.force_discharge;
+
+	node.sysctl_data = &force_discharge;
+	err = sysctl_lookup(SYSCTLFN_CALL(&node));
+	if (err || newp == NULL)
+		return err;
+
+	mutex_enter(&sc->sc_mutex);
+
+	if (!sc->sc_bmd_capability.flag.force_discharge) {
+		err = ENOTTY;
+		goto out;
+	}
+
+	rv = acpi_eval_set_integer(sc->sc_node->ad_handle, "_BMC",
+	    sc->sc_bmd_status.raw & 0x07);
+	if (ACPI_FAILURE(rv)) {
+		aprint_error_dev(dv, "could not set _BMC: %s\n",
+		    AcpiFormatException(rv));
+		err = EIO;
+		goto out;
+	}
+	sc->sc_bmd_status.flag.force_discharge = force_discharge;
+out:
+	mutex_exit(&sc->sc_mutex);
+	return err;
+}
+
+static void
+acpibat_sysctl_setup(device_t self)
+{
+	struct acpibat_softc *sc = device_private(self);
+	const struct sysctlnode *rnode;
+	int err;
+
+	err = sysctl_createv(&sc->sc_log, 0, NULL, &rnode,
+	    0, CTLTYPE_NODE, "acpi", NULL,
+	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL);
+	if (err)
+		goto fail;
+
+	err = sysctl_createv(&sc->sc_log, 0, &rnode, &rnode,
+	    0, CTLTYPE_NODE, device_xname(self),
+	    SYSCTL_DESCR("ACPI battery maintenance controls"),
+	    NULL, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+	if (err)
+		goto fail;
+
+	(void)sysctl_createv(&sc->sc_log, 0, &rnode, NULL,
+	    CTLFLAG_READWRITE, CTLTYPE_BOOL, "calibrate",
+	    SYSCTL_DESCR("battery calibration cycle"),
+	    acpibat_sysctl_calibrate, 0, (void *)self, 0,
+	    CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(&sc->sc_log, 0, &rnode, NULL,
+	    CTLFLAG_READWRITE, CTLTYPE_BOOL, "charge_inhibit",
+	    SYSCTL_DESCR("disable charging while on AC"),
+	    acpibat_sysctl_charge_inhibit, 0, (void *)self, 0,
+	    CTL_CREATE, CTL_EOL);
+
+	(void)sysctl_createv(&sc->sc_log, 0, &rnode, NULL,
+	    CTLFLAG_READWRITE, CTLTYPE_BOOL, "force_discharge",
+	    SYSCTL_DESCR("discharge while on AC"),
+	    acpibat_sysctl_force_discharge, 0, (void *)self, 0,
+	    CTL_CREATE, CTL_EOL);
+
+	return;
+
+fail:
+	aprint_error_dev(self, "unable to add sysctl nodes (%d)\n", err);
 }
 
 MODULE(MODULE_CLASS_DRIVER, acpibat, "sysmon_envsys");

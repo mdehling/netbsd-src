@@ -17,7 +17,7 @@ WARNS?=	6
 COPTS.zfs.c+=	-Wno-unknown-pragmas
 COPTS.zfs.c+=	-Wno-sign-conversion
 COPTS.zfs.c+=	-Wno-strict-prototypes
-LDADD+=	-lnvpair -lzfs
+LDADD+=	-lnvpair
 
 OSNET=${NETBSDSRCDIR}/external/cddl/osnet
 CPPFLAGS+=	-DHAVE_ZFS

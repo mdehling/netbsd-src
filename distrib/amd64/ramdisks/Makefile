@@ -1,8 +1,13 @@
-#	$NetBSD: Makefile,v 1.4.20.1 2024/02/23 18:07:24 martin Exp $
+#	$NetBSD$
+
+.include <bsd.own.mk>
 
 SUBDIR=
 SUBDIR+=	ramdisk
 SUBDIR+=	ramdisk-cgdroot
+.if ${MKZFS} != "no"
+SUBDIR+=	ramdisk-cgdzfsroot
+.endif
 SUBDIR+=	ramdisk-zfsroot
 
 TARGETS+=	release

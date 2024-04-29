@@ -73,6 +73,11 @@ __RCSID("$NetBSD: cgdconfig.c,v 1.61 2022/11/17 06:40:38 chs Exp $");
 
 #include <ufs/ffs/fs.h>
 
+#ifdef HAVE_ZFS
+#include <sys/vdev_impl.h>
+#include <sha2.h>
+#endif
+
 #include "params.h"
 #include "pkcs5_pbkdf2.h"
 #include "utils.h"
@@ -170,6 +175,9 @@ static int	 verify_ffs(int);
 static int	 verify_reenter(struct params *);
 static int	 verify_mbr(int);
 static int	 verify_gpt(int);
+#ifdef HAVE_ZFS
+static int	 verify_zfs(int);
+#endif
 
 __dead static void	 usage(void);
 
@@ -1024,6 +1032,10 @@ verify(struct params *p, int fd)
 		return verify_mbr(fd);
 	case VERIFY_GPT:
 		return verify_gpt(fd);
+#ifdef HAVE_ZFS
+	case VERIFY_ZFS:
+		return verify_zfs(fd);
+#endif
 	default:
 		warnx("unimplemented verification method");
 		return -1;
@@ -1181,6 +1193,103 @@ verify_gpt(int fd)
 
 	return ret;
 }
+
+#ifdef HAVE_ZFS
+
+#define ZIO_CHECKSUM_BE(zcp)					\
+{								\
+	(zcp)->zc_word[0] = BE_64((zcp)->zc_word[0]);		\
+	(zcp)->zc_word[1] = BE_64((zcp)->zc_word[1]);		\
+	(zcp)->zc_word[2] = BE_64((zcp)->zc_word[2]);		\
+	(zcp)->zc_word[3] = BE_64((zcp)->zc_word[3]);		\
+}
+
+static int
+verify_zfs(int fd)
+{
+	vdev_phys_t *vdev_phys;
+	off_t vdev_size, vdev_phys_off;
+	ssize_t ret;
+	bool byteswap;
+	zio_cksum_t cksum_found, cksum_real;
+	SHA256_CTX ctx;
+
+	if (prog_ioctl(fd, DIOCGMEDIASIZE, &vdev_size) == -1) {
+		warn("ioctl");
+		return 1;
+	}
+
+	vdev_phys = emalloc(sizeof *vdev_phys);
+	for (int l = 0; l < VDEV_LABELS; l++) {
+		vdev_phys_off = ( l < VDEV_LABELS/2 ?
+		    l * sizeof(vdev_label_t) :
+		    vdev_size - (VDEV_LABELS-l) * sizeof(vdev_label_t) ) \
+		    + offsetof(vdev_label_t, vl_vdev_phys);
+
+		ret = prog_pread(fd, vdev_phys, sizeof *vdev_phys,
+		    vdev_phys_off);
+		if (ret < 0) {
+			warn("pread");
+			ret = 1;
+			break;
+		} else if ((size_t)ret < sizeof *vdev_phys) {
+			warnx("pread: incomplete block");
+			ret = 1;
+			break;
+		}
+
+		ret = 0;
+
+		if (vdev_phys->vp_zbt.zec_magic == BSWAP_64(ZEC_MAGIC))
+			byteswap = true;
+		else if (vdev_phys->vp_zbt.zec_magic == ZEC_MAGIC)
+			byteswap = false;
+		else {
+			ret = 1;
+			break;
+		};
+
+		cksum_found = vdev_phys->vp_zbt.zec_cksum;
+		if (byteswap)
+			ZIO_CHECKSUM_BSWAP(&cksum_found);
+
+		ZIO_SET_CHECKSUM(&vdev_phys->vp_zbt.zec_cksum,
+		    vdev_phys_off, 0, 0, 0);
+		if (byteswap)
+			ZIO_CHECKSUM_BSWAP(&vdev_phys->vp_zbt.zec_cksum);
+
+		SHA256Init(&ctx);
+		SHA256Update(&ctx, (uint8_t *)vdev_phys, sizeof *vdev_phys);
+		SHA256Final(&cksum_real, &ctx);
+
+		/*
+		 * For historical reasons the on-disk sha256 checksums are
+		 * always in big endian format.
+		 * (see cddl/osnet/dist/uts/common/fs/zfs/sha256.c)
+		 */
+		ZIO_CHECKSUM_BE(&cksum_real);
+
+		if (!ZIO_CHECKSUM_EQUAL(cksum_found, cksum_real)) {
+			warnx("checksum mismatch on vdev label %d", l);
+			warnx("found %lx, %lx, %lx, %lx",
+			    (unsigned long)cksum_found.zc_word[0],
+			    (unsigned long)cksum_found.zc_word[1],
+			    (unsigned long)cksum_found.zc_word[2],
+			    (unsigned long)cksum_found.zc_word[3]);
+			warnx("expected %lx, %lx, %lx, %lx",
+			    (unsigned long)cksum_real.zc_word[0],
+			    (unsigned long)cksum_real.zc_word[1],
+			    (unsigned long)cksum_real.zc_word[2],
+			    (unsigned long)cksum_real.zc_word[3]);
+			ret = 1;
+			break;
+		}
+	}
+	free(vdev_phys);
+	return ret;
+}
+
+#endif
 
 static off_t sblock_try[] = SBLOCKSEARCH;
 
